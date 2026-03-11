@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch
 import torch.nn as nn
 from torch.nn import MultiheadAttention
-from layers import GraphAttentionLayer, SpGraphAttentionLayer,GraphConvolutionLayer,SpResidualAttentionLayer
+# from layers import GraphAttentionLayer, SpGraphAttentionLayer,GraphConvolutionLayer,SpResidualAttentionLayer
 
 class GCN(nn.Module):
     def __init__(self, in_ft, out_ft, act, bias=True):

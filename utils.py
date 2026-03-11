@@ -65,7 +65,7 @@ def dense_to_one_hot(labels_dense, num_classes):
 
 def load_mat(dataset, train_rate=0.3, val_rate=0.1):
    
-    data = sio.loadmat("/home/sp429ltx/fuxian/fuxian/motif_cola/nCoLA+gae-main/data_motif/{}_both_motif.mat".format(dataset))
+    data = sio.loadmat("C:/Users/JoJo/master/zh/HSLGAD/data_motif/{}_both_motif.mat".format(dataset))
     data = sio.loadmat(f"./data_motif/{dataset}_both_motif.mat")
     label = data['Label'] if ('Label' in data) else data['gnd']
     attr = data['Attributes'] if ('Attributes' in data) else data['X']
