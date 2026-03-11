@@ -69,7 +69,7 @@ os.environ['PYTHONHASHSEED'] = str(args.seed)
 os.environ['OMP_NUM_THREADS'] = '1'
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-device = torch.device("cuda:2" if args.cuda else "cpu")
+device = torch.device("cuda:0" if args.cuda else "cpu")
 print(device)
 
 adj, adj_norm,features, labels, idx_train, idx_val,\
@@ -118,6 +118,7 @@ if torch.cuda.is_available():
     print('Using CUDA')
     model.to(device)
     features = features.to(device)
+    raw_features = raw_features.to(device)  # 新增这一行
     adj = adj.to(device)
     labels = labels.to(device)
     idx_train = idx_train.to(device)
@@ -320,7 +321,7 @@ with tqdm(total=args.auc_test_rounds) as pbar_test:
             raw_bf = torch.cat((raw_bf[:, :-1, :], added_feat_zero_row, raw_bf[:, -1:, :]), dim=1)
 
             with torch.no_grad():
-                logits,dist = model.inference(bf,raw_bf,ba,bam,bm,args.alpha)
+                logits, dist, _, _ = model.inference(bf,raw_bf,ba,bam,bm,args.alpha)
                 logits = torch.sigmoid(logits)
             scaler1 = MinMaxScaler()
             scaler2 = MinMaxScaler()
