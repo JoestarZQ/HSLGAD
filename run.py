@@ -35,6 +35,7 @@ parser.add_argument('--negsamp_ratio', type=int, default=1)
 parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
 parser.add_argument('--alpha', type=float, default=0.7, help='balance parameter')
 parser.add_argument('--beta', type=float, default=0.6, help='loss parameter')
+parser.add_argument('--gamma', type=float, default=0.3, help='weight for curvature loss') # 新增几何权重
 parser.add_argument('--cuda', type= bool,default=True, help='Use CUDA if available')
 args = parser.parse_args()
 
@@ -75,7 +76,8 @@ print(device)
 adj, adj_norm,features, labels, idx_train, idx_val,\
 idx_test, ano_label, str_ano_label, attr_ano_label,motifs,= load_mat(args.dataset)
 
-
+print("Computing Ricci Curvature...")
+curvature_matrix = compute_ricci_curvature(adj)
 
 raw_features = features.todense()
 features, _ = preprocess_features(features)
@@ -87,7 +89,7 @@ nb_classes = labels.shape[1]
 motifs_size = motifs.shape[1]
 
 adj = normalize_adj(adj)
-adj = (adj + sp.eye(adj.shape[0])).todense()
+adj = (adj + sp.eye(adj.shape[0])).todense()#A = A + I
 
 features = torch.FloatTensor(features[np.newaxis])
 raw_features = torch.FloatTensor(raw_features[np.newaxis])
@@ -201,7 +203,7 @@ with tqdm(total=args.num_epoch) as pbar:
             for i in idx:
                 cur_adj = adj[:, subgraphs[i], :][:, :, subgraphs[i]]
                 cur_feat = features[:, subgraphs[i], :]
-                cur_motif = motifs_norm[:,subgraphs[i], :]
+                cur_motif = motifs_norm[:, subgraphs[i], :]
                 cur_adjm = adj[:, subgraphs[i], :][:, :, subgraphs[i]]
                 raw_cur_feat = raw_features[:, subgraphs[i], :]
                 ba.append(cur_adj)
@@ -210,28 +212,51 @@ with tqdm(total=args.num_epoch) as pbar:
                 bam.append(cur_adjm)
                 raw_bf.append(raw_cur_feat)
 
+                # ========= 替换的部分开始 =========
+                # 新增：定义 motif 维度的全零占位符，用于维度对齐
+            added_motif_zero_row = torch.zeros((cur_batch_size, 1, motifs_size))
+            if torch.cuda.is_available():
+                added_motif_zero_row = added_motif_zero_row.to(device)
 
             ba = torch.cat(ba)
             ba = torch.cat((ba, added_adj_zero_row), dim=1)
             ba = torch.cat((ba, added_adj_zero_col), dim=2)
+
             bf = torch.cat(bf)
-            bf = torch.cat((bf[:, :-1, :], added_feat_zero_row, bf[:, -1:, :]),dim=1)
-            bam = torch.cat(bam)
-            bm = torch.cat(bm)
+            bf = torch.cat((bf[:, :-1, :], added_feat_zero_row, bf[:, -1:, :]), dim=1)
+
             raw_bf = torch.cat(raw_bf)
             raw_bf = torch.cat((raw_bf[:, :-1, :], added_feat_zero_row, raw_bf[:, -1:, :]), dim=1)
-            logits,s_1,f_2= model(bf,raw_bf, ba,bam, bm)
+
+            # 修复 1：对 bam(结构邻接矩阵) 进行与 ba 相同的扩展
+            bam = torch.cat(bam)
+            bam = torch.cat((bam, added_adj_zero_row), dim=1)
+            bam = torch.cat((bam, added_adj_zero_col), dim=2)
+
+            # 修复 2：对 bm(结构特征矩阵) 进行与 bf 相同的扩展
+            bm = torch.cat(bm)
+            bm = torch.cat((bm[:, :-1, :], added_motif_zero_row, bm[:, -1:, :]), dim=1)
+
+            # 现在维度已经对齐，可以传入模型
+            logits, s_1, f_2, f_v = model(bf, raw_bf, ba, bam, bm)
             loss_all = b_xent(logits, lbl)
 
+            loss_cl = torch.mean(loss_all)
+            loss_re = args.alpha * mse_loss(s_1[:, -2, :], bm[:, -1, :]) + \
+                      (1 - args.alpha) * mse_loss(f_2[:, -2, :], raw_bf[:, -1, :])
 
-            loss1 = torch.mean(loss_all)
-            loss2 = args.alpha * mse_loss(s_1[:, -2, :],bm [:, -1, :]) +(1-args.alpha)*mse_loss(f_2[:, -2, :], raw_bf[:, -1, :])
-            loss = (1-args.beta) * loss1 + args.beta * loss2
+            kappa_hat = model.curv_dec(f_v[:, -1, :], f_v[:, -2, :])
+            target_kappa = get_batch_curvature(idx, subgraphs, curvature_matrix).to(device)
+            loss_curv = mse_loss(kappa_hat, target_kappa)
+
+            loss = (1 - args.beta - args.gamma) * loss_cl + args.beta * loss_re + args.gamma * loss_curv
+            # ========= 替换的部分结束 =========
+
             loss.backward()
             optimiser.step()
 
             loss = loss.detach().cpu().numpy()
-            loss_full_batch[idx] = loss_all[: cur_batch_size].detach()
+            loss_full_batch[idx] = loss_cl[: cur_batch_size].detach()
 
             if not is_final_batch:
                 total_loss += loss
@@ -301,7 +326,7 @@ with tqdm(total=args.auc_test_rounds) as pbar_test:
             for i in idx:
                 cur_adj = adj[:, subgraphs[i], :][:, :, subgraphs[i]]
                 cur_feat = features[:, subgraphs[i], :]
-                cur_motif = motifs_norm[:,subgraphs[i], :]
+                cur_motif = motifs_norm[:, subgraphs[i], :]
                 cur_adjm = adj[:, subgraphs[i], :][:, :, subgraphs[i]]
                 raw_cur_feat = raw_features[:, subgraphs[i], :]
                 bm.append(cur_motif)
@@ -310,27 +335,52 @@ with tqdm(total=args.auc_test_rounds) as pbar_test:
                 bam.append(cur_adjm)
                 raw_bf.append(raw_cur_feat)
 
+                # ========= 替换的部分开始 =========
+            added_motif_zero_row = torch.zeros((cur_batch_size, 1, motifs_size))
+            if torch.cuda.is_available():
+                added_motif_zero_row = added_motif_zero_row.to(device)
+
             ba = torch.cat(ba)
             ba = torch.cat((ba, added_adj_zero_row), dim=1)
             ba = torch.cat((ba, added_adj_zero_col), dim=2)
+
             bf = torch.cat(bf)
             bf = torch.cat((bf[:, :-1, :], added_feat_zero_row, bf[:, -1:, :]), dim=1)
-            bm = torch.cat(bm)
-            bam = torch.cat(bam)
+
             raw_bf = torch.cat(raw_bf)
             raw_bf = torch.cat((raw_bf[:, :-1, :], added_feat_zero_row, raw_bf[:, -1:, :]), dim=1)
 
+            # 修复 1：bam 扩展
+            bam = torch.cat(bam)
+            bam = torch.cat((bam, added_adj_zero_row), dim=1)
+            bam = torch.cat((bam, added_adj_zero_col), dim=2)
+
+            # 修复 2：bm 扩展
+            bm = torch.cat(bm)
+            bm = torch.cat((bm[:, :-1, :], added_motif_zero_row, bm[:, -1:, :]), dim=1)
+
             with torch.no_grad():
-                logits, dist, _, _ = model.inference(bf,raw_bf,ba,bam,bm,args.alpha)
+                logits, dist_combined, f_v = model.inference(bf, raw_bf, ba, bam, bm, args.alpha)
                 logits = torch.sigmoid(logits)
+
+            k_pred = model.curv_dec(torch.cat([f_v[:, -1, :], f_v[:, -2, :]], dim=-1)).squeeze()
+            k_true = get_batch_curvature(idx, subgraphs, curvature_matrix).to(device)
+            r_curv = torch.pow(k_true - k_pred, 2).cpu().numpy()
+
+            s_cl = - (logits[:cur_batch_size] - logits[cur_batch_size:]).cpu().numpy()
+            s_re = dist_combined.cpu().numpy()
+            s_geo = r_curv
+
             scaler1 = MinMaxScaler()
             scaler2 = MinMaxScaler()
-            ano_score1 = - (logits[:cur_batch_size] - logits[cur_batch_size:]).cpu().numpy()
-            ano_score2 = dist.cpu().numpy()
-            ano_score_1 = scaler1.fit_transform(ano_score1.reshape(-1, 1)).reshape(-1)
-            ano_score_2 = scaler2.fit_transform(ano_score2.reshape(-1, 1)).reshape(-1)
-            ano_score = (1-args.beta) * ano_score_1 + args.beta * ano_score_2
+            scaler3 = MinMaxScaler()
 
+            s_1 = scaler1.fit_transform(s_cl.reshape(-1, 1)).flatten()
+            s_2 = scaler2.fit_transform(s_re.reshape(-1, 1)).flatten()
+            s_3 = scaler3.fit_transform(s_geo.reshape(-1, 1)).flatten()
+
+            ano_score = (1 - args.beta - args.gamma) * s_1 + args.beta * s_2 + args.gamma * s_3
+            # ========= 替换的部分结束 =========
 
             multi_round_ano_score[round, idx] = ano_score
 

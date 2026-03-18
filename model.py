@@ -6,6 +6,23 @@ import torch.nn as nn
 from torch.nn import MultiheadAttention
 # from layers import GraphAttentionLayer, SpGraphAttentionLayer,GraphConvolutionLayer,SpResidualAttentionLayer
 
+class AttentionFusion(nn.Module):
+    def __init__(self, n_h):
+        super(AttentionFusion, self).__init__()
+        self.att = nn.Sequential(
+            nn.Linear(n_h * 2, n_h),
+            nn.Tanh(),
+            nn.Linear(n_h, 2), # 输出两个权值 α1, α2
+            nn.Softmax(dim=-1)
+        )
+
+    def forward(self, h_v, z_m):
+        # fv = α1hv + α2z(m)v
+        cat_feat = torch.cat([h_v, z_m], dim=-1)
+        alpha = self.att(cat_feat) # (batch, nodes, 2)
+        f_v = alpha[:, :, 0:1] * h_v + alpha[:, :, 1:2] * z_m
+        return f_v, alpha
+
 class GCN(nn.Module):
     def __init__(self, in_ft, out_ft, act, bias=True):
         super(GCN, self).__init__()
@@ -117,18 +134,101 @@ class Structure_Decoder(nn.Module):
 
         return x
 
+class Curvature_Decoder(nn.Module):
+    def __init__(self, n_h):
+        super(Curvature_Decoder, self).__init__()
+        # 公式 (18): 两层 MLP 作用于拼接的嵌入 [fu || fv]
+        self.mlp = nn.Sequential(
+            nn.Linear(n_h * 2, n_h),
+            nn.ReLU(),
+            nn.Linear(n_h, 1)
+        )
+
+    def forward(self, fu, fv):
+        # 拼接节点对的嵌入
+        combined = torch.cat((fu, fv), dim=-1)
+        return self.mlp(combined).squeeze(-1)
+
+# class Model(nn.Module):
+#     def __init__(self, n_in, n_h, activation, negsamp_round, readout,motif_size,hidden1,hidden2,alpha,dropout=0.2):
+#         super(Model, self).__init__()
+#         self.read_mode = readout
+#         self.alpha = alpha
+#         self.dropout = dropout
+#         self.gcn = GCN(n_in, n_h, activation)
+#         self.dec = GCN(n_h, n_in, activation)
+#         self.gc_enc1 = GCN(motif_size, n_h,activation)
+#         self.gc_dec1 = GCN(n_h, motif_size,activation)
+#         self.pdist = nn.PairwiseDistance(p=2)
+#
+#         if readout == 'max':
+#             self.read = MaxReadout()
+#         elif readout == 'min':
+#             self.read = MinReadout()
+#         elif readout == 'avg':
+#             self.read = AvgReadout()
+#         elif readout == 'weighted_sum':
+#             self.read = WSReadout()
+#
+#         self.disc = Discriminator(n_h, negsamp_round)
+#
+#     def forward(self, seq1,seq2, adj,adjm,motifs, sparse=False):
+#
+#
+#         s_0 = self.gc_enc1(motifs,adjm,sparse)
+#         s_1 = self.gc_dec1(s_0,adjm,sparse)
+#         h_1 = self.gcn(seq1, adj, sparse)
+#         f_1 = self.gcn(seq2, adj, sparse)
+#
+#         f_2 = self.dec(f_1,adj,sparse)
+#         if self.read_mode != 'weighted_sum':
+#             c = self.read(h_1[:,: -1,:])
+#             h_mv = h_1[:,-1,:]
+#         else:
+#             h_mv = h_1[:, -1, :]
+#             c = self.read(h_1[:,: -1,:], h_1[:,-2: -1, :])
+#
+#         ret = self.disc(c, h_mv)
+#
+#         return ret,s_1,f_2
+#
+#     def inference(self, seq1,seq2,adj, adjm, motifs, alpha,sparse=False):
+#         s_0 = self.gc_enc1(motifs, adjm, sparse)
+#         s_1 = self.gc_dec1(s_0, adjm, sparse)
+#         h_1 = self.gcn(seq1, adj, sparse)
+#
+#         f_0 = self.gcn(seq2,adj,sparse)
+#         f_1 = self.dec(f_0,adj,sparse)
+#         dist0 = self.pdist(s_1[:, -2, :], motifs[:, -1, :])
+#         dist1 = self.pdist(f_1[:, -2, :], seq2[:, -1, :])
+#         dist = alpha*dist0+(1-alpha)*dist1
+#
+#         if self.read_mode != 'weighted_sum':
+#             c = self.read(h_1[:,: -1,:])
+#             h_mv = h_1[:,-1,:]
+#         else:
+#             h_mv = h_1[:, -1, :]
+#             c = self.read(h_1[:,: -1,:], h_1[:,-2: -1, :])
+#
+#         ret = self.disc(c, h_mv)
+#
+#         return ret,dist,dist0,dist1
+
+
 class Model(nn.Module):
-    def __init__(self, n_in, n_h, activation, negsamp_round, readout,motif_size,hidden1,hidden2,alpha,dropout=0.2):
+    def __init__(self, n_in, n_h, activation, negsamp_round, readout, motif_size, hidden1, hidden2, alpha, dropout=0.2):
         super(Model, self).__init__()
-        self.read_mode = readout
-        self.alpha = alpha
-        self.dropout = dropout
-        self.gcn = GCN(n_in, n_h, activation)
-        self.dec = GCN(n_h, n_in, activation)
-        self.gc_enc1 = GCN(motif_size, n_h,activation)
-        self.gc_dec1 = GCN(n_h, motif_size,activation)
-        self.pdist = nn.PairwiseDistance(p=2)
-        
+        # ... 原有初始化 ...
+        self.gcn_sem = GCN(n_in, n_h, activation)  # 语义编码器
+        self.gc_enc_str = GCN(motif_size, n_h, activation)  # 结构编码器
+
+        self.fusion = AttentionFusion(n_h)  # 注意力融合层 (fv = α1*hv + α2*zm)
+        self.curv_dec = Curvature_Decoder(n_h)  # 曲率解码器
+
+        self.dec_sem = GCN(n_h, n_in, activation)  # 语义重构器 (可选任务)
+        self.gc_dec_str = GCN(n_h, motif_size, activation)  # 结构重构器
+
+        self.disc = Discriminator(n_h, negsamp_round)  # 判别器 (对比学习任务)
         if readout == 'max':
             self.read = MaxReadout()
         elif readout == 'min':
@@ -138,46 +238,24 @@ class Model(nn.Module):
         elif readout == 'weighted_sum':
             self.read = WSReadout()
 
-        self.disc = Discriminator(n_h, negsamp_round)
+    def forward(self, seq_sem, seq_raw, adj, adjm, motifs, sparse=False):
+        # 1. 语义特征提取 (hv)
+        h_v = self.gcn_sem(seq_sem, adj, sparse)
 
-    def forward(self, seq1,seq2, adj,adjm,motifs, sparse=False):
+        # 2. 结构特征提取 (zm)
+        z_m = self.gc_enc_str(motifs, adjm, sparse)
 
-       
-        s_0 = self.gc_enc1(motifs,adjm,sparse)
-        s_1 = self.gc_dec1(s_0,adjm,sparse)
-        h_1 = self.gcn(seq1, adj, sparse)  
-        f_1 = self.gcn(seq2, adj, sparse)
+        # 3. 注意力融合 (fv) - 融合语义与结构
+        f_v, att_weights = self.fusion(h_v, z_m)
 
-        f_2 = self.dec(f_1,adj,sparse)
-        if self.read_mode != 'weighted_sum':
-            c = self.read(h_1[:,: -1,:]) 
-            h_mv = h_1[:,-1,:]
-        else:
-            h_mv = h_1[:, -1, :]
-            c = self.read(h_1[:,: -1,:], h_1[:,-2: -1, :])
+        # 任务一：语义对比学习 (基于融合后的 fv 或原始 hv，建议用 fv 增强任务关联)
+        c = self.read(f_v[:, :-1, :])
+        ret = self.disc(c, f_v[:, -1, :])
 
-        ret = self.disc(c, h_mv)
+        # 任务二：结构重构 (生成 s_1 用于计算 rmotif)
+        s_1 = self.gc_dec_str(f_v, adjm, sparse)
 
-        return ret,s_1,f_2
+        # 额外任务：语义重构 (生成 f_2 用于计算 rsem)
+        f_2 = self.dec_sem(f_v, adj, sparse)
 
-    def inference(self, seq1,seq2,adj, adjm, motifs, alpha,sparse=False):
-        s_0 = self.gc_enc1(motifs, adjm, sparse)
-        s_1 = self.gc_dec1(s_0, adjm, sparse)
-        h_1 = self.gcn(seq1, adj, sparse)
-
-        f_0 = self.gcn(seq2,adj,sparse)
-        f_1 = self.dec(f_0,adj,sparse)
-        dist0 = self.pdist(s_1[:, -2, :], motifs[:, -1, :])
-        dist1 = self.pdist(f_1[:, -2, :], seq2[:, -1, :])
-        dist = alpha*dist0+(1-alpha)*dist1
-
-        if self.read_mode != 'weighted_sum':
-            c = self.read(h_1[:,: -1,:]) 
-            h_mv = h_1[:,-1,:]
-        else:
-            h_mv = h_1[:, -1, :]
-            c = self.read(h_1[:,: -1,:], h_1[:,-2: -1, :])
-
-        ret = self.disc(c, h_mv)
-
-        return ret,dist,dist0,dist1
+        return ret, s_1, f_2, f_v
