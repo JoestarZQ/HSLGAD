@@ -256,7 +256,7 @@ with tqdm(total=args.num_epoch) as pbar:
             optimiser.step()
 
             loss = loss.detach().cpu().numpy()
-            loss_full_batch[idx] = loss_cl[: cur_batch_size].detach()
+            loss_full_batch[idx] = loss_all[: cur_batch_size].detach()
 
             if not is_final_batch:
                 total_loss += loss
