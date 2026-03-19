@@ -218,17 +218,19 @@ class Curvature_Decoder(nn.Module):
 class Model(nn.Module):
     def __init__(self, n_in, n_h, activation, negsamp_round, readout, motif_size, hidden1, hidden2, alpha, dropout=0.2):
         super(Model, self).__init__()
-        # ... 原有初始化 ...
-        self.gcn_sem = GCN(n_in, n_h, activation)  # 语义编码器
-        self.gc_enc_str = GCN(motif_size, n_h, activation)  # 结构编码器
+        self.read_mode = readout # 确保保存了 readout 模式
+        self.gcn_sem = GCN(n_in, n_h, activation)
+        self.gc_enc_str = GCN(motif_size, n_h, activation)
 
-        self.fusion = AttentionFusion(n_h)  # 注意力融合层 (fv = α1*hv + α2*zm)
-        self.curv_dec = Curvature_Decoder(n_h)  # 曲率解码器
+        self.fusion = AttentionFusion(n_h)
+        self.curv_dec = Curvature_Decoder(n_h)
 
-        self.dec_sem = GCN(n_h, n_in, activation)  # 语义重构器 (可选任务)
-        self.gc_dec_str = GCN(n_h, motif_size, activation)  # 结构重构器
+        self.dec_sem = GCN(n_h, n_in, activation)
+        self.gc_dec_str = GCN(n_h, motif_size, activation)
 
-        self.disc = Discriminator(n_h, negsamp_round)  # 判别器 (对比学习任务)
+        self.disc = Discriminator(n_h, negsamp_round)
+        self.pdist = nn.PairwiseDistance(p=2) # 用于计算重构距离
+
         if readout == 'max':
             self.read = MaxReadout()
         elif readout == 'min':
@@ -239,23 +241,38 @@ class Model(nn.Module):
             self.read = WSReadout()
 
     def forward(self, seq_sem, seq_raw, adj, adjm, motifs, sparse=False):
-        # 1. 语义特征提取 (hv)
+        # 1. 提取语义与结构特征
         h_v = self.gcn_sem(seq_sem, adj, sparse)
-
-        # 2. 结构特征提取 (zm)
         z_m = self.gc_enc_str(motifs, adjm, sparse)
 
-        # 3. 注意力融合 (fv) - 融合语义与结构
+        # 2. 注意力融合
         f_v, att_weights = self.fusion(h_v, z_m)
 
-        # 任务一：语义对比学习 (基于融合后的 fv 或原始 hv，建议用 fv 增强任务关联)
+        # 3. 对比学习任务 (基于融合特征)
         c = self.read(f_v[:, :-1, :])
         ret = self.disc(c, f_v[:, -1, :])
 
-        # 任务二：结构重构 (生成 s_1 用于计算 rmotif)
-        s_1 = self.gc_dec_str(f_v, adjm, sparse)
-
-        # 额外任务：语义重构 (生成 f_2 用于计算 rsem)
-        f_2 = self.dec_sem(f_v, adj, sparse)
+        # 4. 重构任务
+        s_1 = self.gc_dec_str(f_v, adjm, sparse) # 结构重构
+        f_2 = self.dec_sem(f_v, adj, sparse)    # 语义重构
 
         return ret, s_1, f_2, f_v
+
+    # 新增的 inference 方法，适配 run.py 的调用
+    def inference(self, seq_sem, seq_raw, adj, adjm, motifs, alpha, sparse=False):
+        # 1. 执行前向传播获取所有中间变量
+        logits, s_1, f_2, f_v = self.forward(seq_sem, seq_raw, adj, adjm, motifs, sparse)
+
+        # 2. 计算结构重构误差 (rmotif)
+        # 对应 run.py 中 s_1[:, -2, :] 与 motifs[:, -1, :] 的距离
+        dist_s = torch.mean(torch.pow(s_1[:, -2, :] - motifs[:, -1, :], 2), dim=1)
+
+        # 3. 计算语义重构误差 (rsem)
+        # 对应 run.py 中 f_2[:, -2, :] 与 seq_raw[:, -1, :] 的距离
+        dist_f = torch.mean(torch.pow(f_2[:, -2, :] - seq_raw[:, -1, :], 2), dim=1)
+
+        # 4. 根据 alpha 融合重构得分
+        dist_combined = alpha * dist_s + (1 - alpha) * dist_f
+
+        # 返回 logits(对比学习得分), dist_combined(重构得分), f_v(用于曲率计算)
+        return logits, dist_combined, f_v

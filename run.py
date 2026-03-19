@@ -362,10 +362,12 @@ with tqdm(total=args.auc_test_rounds) as pbar_test:
             with torch.no_grad():
                 logits, dist_combined, f_v = model.inference(bf, raw_bf, ba, bam, bm, args.alpha)
                 logits = torch.sigmoid(logits)
+                # 将曲率预测移到这里
+                k_pred = model.curv_dec(f_v[:, -1, :], f_v[:, -2, :]).squeeze()
 
-            k_pred = model.curv_dec(torch.cat([f_v[:, -1, :], f_v[:, -2, :]], dim=-1)).squeeze()
+            # k_pred = model.curv_dec(torch.cat([f_v[:, -1, :], f_v[:, -2, :]], dim=-1)).squeeze()
             k_true = get_batch_curvature(idx, subgraphs, curvature_matrix).to(device)
-            r_curv = torch.pow(k_true - k_pred, 2).cpu().numpy()
+            r_curv = torch.pow(k_true - k_pred, 2).detach().cpu().numpy()
 
             s_cl = - (logits[:cur_batch_size] - logits[cur_batch_size:]).cpu().numpy()
             s_re = dist_combined.cpu().numpy()
